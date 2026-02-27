@@ -145,6 +145,7 @@ async def enrich_pending_listings(db: AsyncSession | None = None):
                     accessibility_tags=listing.accessibility_tags or [],
                     photos_count=listing.photos_count or 0,
                     ml_estimated_price=ml_price,
+                    source=listing.source,
                 )
 
                 enrichment = ListingEnrichment(id=uuid.uuid4(), listing_id=listing.id, **data)

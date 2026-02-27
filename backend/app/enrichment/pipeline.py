@@ -1,6 +1,10 @@
 """
 Enrichment pipeline orchestrator.
 Runs all enrichers on a listing and returns a dict ready to upsert into listing_enrichments.
+
+Geo data (Overpass API) is intentionally skipped for bulk mock data to avoid rate-limiting.
+City-level transport/commercial scores from market_enricher are used instead.
+Overpass is only called for real scraped listings with precise coordinates (source != 'mock').
 """
 import logging
 
@@ -22,17 +26,19 @@ async def run_enrichment_pipeline(
     accessibility_tags: list[str],
     photos_count: int,
     ml_estimated_price: float | None = None,
+    source: str = "mock",
 ) -> dict:
     """
     Full enrichment pipeline for one listing.
     Returns a flat dict matching listing_enrichments columns.
     """
-    # 1. Market data (local stats)
+    # 1. Market data (city-level stats — instant, no external call)
     market = get_market_data(city)
 
-    # 2. Geo data (transport, POIs) — only if we have coordinates
-    geo = {"transport_score": 30.0, "commercial_density": 5.0}
-    if lat and lon:
+    # 2. Geo data: use city-level estimates for mock data to avoid Overpass rate-limits.
+    #    For real scraped listings (source != 'mock'), call Overpass with precise coords.
+    geo = {"transport_score": market.transport_score, "commercial_density": market.commercial_density}
+    if source != "mock" and lat and lon:
         try:
             geo = await enrich_geo(lat, lon)
         except Exception as exc:

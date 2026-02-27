@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import TIMESTAMP, ForeignKey, Numeric
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, backref
 
 from app.database import Base
 
@@ -51,4 +51,6 @@ class ListingEnrichment(Base):
         TIMESTAMP(timezone=True), default=datetime.utcnow
     )
 
-    listing: Mapped["Listing"] = relationship("Listing", backref="enrichment")  # noqa: F821
+    listing: Mapped["Listing"] = relationship(  # noqa: F821
+        "Listing", backref=backref("enrichment", uselist=False)
+    )
