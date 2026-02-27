@@ -163,6 +163,96 @@ async def enrich_pending_listings(db: AsyncSession | None = None):
             await db.close()
 
 
+async def reenrich_all_listings(db: AsyncSession | None = None):
+    """
+    Force re-enrich ALL listings (including those already enriched).
+    Uses upsert on listing_id so existing enrichments are updated in-place.
+    Run this after a DVF refresh to propagate updated market prices.
+    Processes listings in batches of 200.
+    """
+    from geoalchemy2.functions import ST_Y, ST_X
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    own_session = db is None
+    if own_session:
+        db = AsyncSessionLocal()
+    try:
+        total = (await db.execute(select(func.count()).select_from(Listing))).scalar_one()
+        logger.info("Force re-enriching all %d listings…", total)
+        offset = 0
+        batch_size = 200
+        processed = 0
+
+        while True:
+            listings = (
+                await db.execute(select(Listing).order_by(Listing.scraped_at).offset(offset).limit(batch_size))
+            ).scalars().all()
+
+            if not listings:
+                break
+
+            for listing in listings:
+                try:
+                    lat = lon = None
+                    if listing.location is not None:
+                        coords = (
+                            await db.execute(
+                                select(
+                                    ST_Y(listing.location).label("lat"),
+                                    ST_X(listing.location).label("lon"),
+                                )
+                            )
+                        ).first()
+                        if coords:
+                            lat, lon = coords.lat, coords.lon
+
+                    market = get_market_data(listing.city)
+                    ml_price = predict_price(
+                        surface=float(listing.surface) if listing.surface else None,
+                        lat=lat,
+                        lon=lon,
+                        city_avg_sell_per_sqm=market.city_avg_sell_per_sqm,
+                        transport_score=30.0,
+                        accessibility_score=20.0,
+                        photos_count=listing.photos_count or 0,
+                    )
+                    data = await run_enrichment_pipeline(
+                        listing_id=str(listing.id),
+                        price=float(listing.price),
+                        surface=float(listing.surface) if listing.surface else None,
+                        city=listing.city,
+                        lat=lat,
+                        lon=lon,
+                        accessibility_tags=listing.accessibility_tags or [],
+                        photos_count=listing.photos_count or 0,
+                        ml_estimated_price=ml_price,
+                        source=listing.source,
+                    )
+
+                    stmt = pg_insert(ListingEnrichment).values(
+                        id=uuid.uuid4(),
+                        listing_id=listing.id,
+                        **data,
+                    ).on_conflict_do_update(
+                        index_elements=["listing_id"],
+                        set_={k: v for k, v in data.items()},
+                    )
+                    await db.execute(stmt)
+                    processed += 1
+
+                except Exception as exc:
+                    logger.warning("Failed to re-enrich listing %s: %s", listing.id, exc)
+
+            await db.commit()
+            logger.info("Re-enrichment progress: %d/%d", processed, total)
+            offset += batch_size
+
+        logger.info("Force re-enrichment complete: %d listings updated", processed)
+    finally:
+        if own_session:
+            await db.close()
+
+
 async def retrain_price_model(db: AsyncSession | None = None):
     own_session = db is None
     if own_session:
