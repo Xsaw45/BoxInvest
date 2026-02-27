@@ -10,6 +10,12 @@ Hardcoded market data in market_enricher.py remains as fallback when DVF is unav
 URL structure: https://files.data.gouv.fr/geo-dvf/latest/csv/{year}/communes/{dept}/{commune}.csv
 Files are plain CSV (not gzip). Cities with arrondissements (Paris, Lyon, Marseille) have one
 file per arrondissement — all files are downloaded and combined before computing the median.
+
+Key DVF data nuance:
+  valeur_fonciere is the total transaction price — it is DUPLICATED across every property row
+  in the same mutation (transaction). A transaction selling 2 garages at 40k€ each shows
+  80k€ on BOTH rows. We must deduplicate by id_mutation and divide by the garage lot count
+  to get a per-unit price, then cap to realistic ranges to exclude outlier storage units.
 """
 import asyncio
 import io
@@ -23,12 +29,11 @@ logger = logging.getLogger(__name__)
 DVF_YEAR = "2024"
 DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 
-# For each city: dept code + list of commune/arrondissement CSV codes to download.
+# For each city: dept code + list of commune/arrondissement CSV codes.
 # Paris:    20 arrondissements → 75101–75120
 # Lyon:     9  arrondissements → 69381–69389
 # Marseille:16 arrondissements → 13201–13216
-# Others:   single commune code
-# Strasbourg (67482) is absent from the communes directory → no entry here, uses hardcoded fallback
+# Strasbourg (67482) is absent from the 2024 communes directory → uses hardcoded fallback.
 CITY_DVF_CONFIG: dict[str, dict] = {
     "Paris": {
         "dept": "75",
@@ -55,15 +60,27 @@ CITY_DVF_CONFIG: dict[str, dict] = {
 # In-memory cache: city → median garage price in €/m²
 _cache: dict[str, float] = {}
 
-# Assumed typical garage surface for price/m² conversion (total transaction price → €/m²)
+# Assumed typical garage surface for price/m² conversion (total price → €/m²)
 _TYPICAL_GARAGE_SQM = 12.0
 
+# Realistic per-unit price bounds for French garages/parking spaces.
+# Below 1 500 € → data error. Above 150 000 € → large commercial storage unit, not a parking space.
+_MIN_PER_LOT = 1_500.0
+_MAX_PER_LOT = 150_000.0
 
-def _parse_garage_price_per_sqm(raw_csv: bytes) -> list[float]:
+
+def _parse_garage_prices(raw_csv: bytes) -> list[float]:
     """
     Sync function (run in thread executor).
-    Parses one DVF commune CSV and returns a list of individual garage transaction prices.
-    Returns empty list if no valid garage rows are found.
+
+    Parses one DVF commune CSV and returns a list of per-unit garage prices (in €).
+
+    Deduplication logic:
+      - `valeur_fonciere` is the TOTAL transaction price, duplicated on every property row.
+      - We group by `id_mutation`, take the price once, and divide by the number of
+        Dépendance lots in that transaction to get a per-unit price.
+      - We cap per-unit prices to [_MIN_PER_LOT, _MAX_PER_LOT] to exclude outliers
+        (large commercial storage boxes, errors, mixed apartment+parking transactions).
     """
     try:
         df = pd.read_csv(
@@ -78,29 +95,50 @@ def _parse_garage_price_per_sqm(raw_csv: bytes) -> list[float]:
 
     df.columns = [c.strip().lower() for c in df.columns]
 
-    required = {"nature_mutation", "type_local", "valeur_fonciere"}
+    required = {"nature_mutation", "type_local", "valeur_fonciere", "id_mutation"}
     if not required.issubset(set(df.columns)):
         return []
 
+    # Keep only garage/parking sales
     mask = (df["nature_mutation"] == "Vente") & (df["type_local"] == "Dépendance")
     garage_df = df[mask].copy()
-
     if garage_df.empty:
         return []
 
-    # DVF may use comma as decimal separator
+    # Parse price (DVF may use comma as decimal separator)
     garage_df["valeur_fonciere"] = (
         garage_df["valeur_fonciere"]
         .str.replace(",", ".", regex=False)
         .pipe(pd.to_numeric, errors="coerce")
     )
-    valid = garage_df["valeur_fonciere"].dropna()
-    valid = valid[valid > 0]
-    return valid.tolist()
+    garage_df = garage_df.dropna(subset=["valeur_fonciere"])
+    garage_df = garage_df[garage_df["valeur_fonciere"] > 0]
+
+    if garage_df.empty:
+        return []
+
+    # Deduplicate: group by id_mutation
+    # - price:  take first() — all rows in a mutation share the same valeur_fonciere
+    # - lots:   count() rows in this mutation that are Dépendance
+    per_mutation = garage_df.groupby("id_mutation").agg(
+        price=("valeur_fonciere", "first"),
+        lots=("id_mutation", "count"),
+    )
+
+    # Per-unit price = total transaction price / number of garage lots
+    per_mutation["per_lot"] = per_mutation["price"] / per_mutation["lots"]
+
+    # Filter to realistic parking/garage price range
+    valid = per_mutation[
+        (per_mutation["per_lot"] >= _MIN_PER_LOT)
+        & (per_mutation["per_lot"] <= _MAX_PER_LOT)
+    ]
+
+    return valid["per_lot"].tolist()
 
 
 async def _fetch_commune(dept: str, commune: str) -> list[float]:
-    """Download one commune CSV and return raw garage transaction prices."""
+    """Download one commune CSV and return raw per-unit garage prices."""
     url = f"{DVF_BASE}/{DVF_YEAR}/communes/{dept}/{commune}.csv"
     try:
         async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
@@ -118,13 +156,14 @@ async def _fetch_commune(dept: str, commune: str) -> list[float]:
         return []
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _parse_garage_price_per_sqm, raw)
+    return await loop.run_in_executor(None, _parse_garage_prices, raw)
 
 
 async def _fetch_city(city: str) -> float | None:
     """
-    Download all commune files for a city, aggregate garage prices, and return median €/m².
-    Returns None if fewer than 5 total garage transactions are found.
+    Download all commune files for a city, aggregate per-unit garage prices,
+    and return the median price in €/m² (divides by _TYPICAL_GARAGE_SQM).
+    Returns None if fewer than 5 valid transactions are found.
     """
     cfg = CITY_DVF_CONFIG.get(city)
     if not cfg:
@@ -133,7 +172,6 @@ async def _fetch_city(city: str) -> float | None:
     dept = cfg["dept"]
     communes = cfg["communes"]
 
-    # Fetch all commune files concurrently (they're small, no extra semaphore needed per city)
     tasks = [_fetch_commune(dept, c) for c in communes]
     results = await asyncio.gather(*tasks)
 
@@ -142,10 +180,17 @@ async def _fetch_city(city: str) -> float | None:
         all_prices.extend(prices)
 
     if len(all_prices) < 5:
+        logger.debug("DVF %s: only %d valid transactions, skipping", city, len(all_prices))
         return None
 
-    median_total = float(pd.Series(all_prices).median())
-    return round(median_total / _TYPICAL_GARAGE_SQM, 2)
+    s = pd.Series(all_prices)
+    median_total = float(s.median())
+    price_per_sqm = round(median_total / _TYPICAL_GARAGE_SQM, 2)
+    logger.info(
+        "DVF %s → median €%.0f/unit → %.0f €/m² (%d transactions)",
+        city, median_total, price_per_sqm, len(all_prices),
+    )
+    return price_per_sqm
 
 
 async def refresh_all_cities() -> None:
@@ -171,10 +216,9 @@ async def refresh_all_cities() -> None:
         city, price = item
         if price is not None:
             _cache[city] = price
-            logger.info("DVF %s → %.1f €/m²", city, price)
             success += 1
         else:
-            logger.warning("DVF %s → no data (using fallback)", city)
+            logger.warning("DVF %s → no data (using hardcoded fallback)", city)
 
     logger.info(
         "DVF refresh complete: %d/%d cities loaded", success, len(CITY_DVF_CONFIG)
