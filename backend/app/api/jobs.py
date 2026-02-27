@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.jobs import ingest_mock_data, enrich_pending_listings, retrain_price_model
+from app.jobs import ingest_mock_data, enrich_pending_listings, retrain_price_model, refresh_dvf_prices
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -36,3 +36,9 @@ async def trigger_train(
 ):
     background_tasks.add_task(retrain_price_model, db)
     return {"status": "scheduled", "job": "train_ml"}
+
+
+@router.post("/refresh-dvf")
+async def trigger_dvf_refresh(background_tasks: BackgroundTasks):
+    background_tasks.add_task(refresh_dvf_prices)
+    return {"status": "scheduled", "job": "refresh_dvf"}

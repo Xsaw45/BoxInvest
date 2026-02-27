@@ -38,11 +38,13 @@ class MarketData:
 
 
 def get_market_data(city: str | None) -> MarketData:
+    from app.enrichment.dvf_enricher import get_cached_price  # local import to avoid circular deps
     data = CITY_MARKET_DATA.get(city or "", CITY_MARKET_DATA["default"])
+    dvf_price = get_cached_price(city or "")
     return MarketData(
         avg_rent_area=data["avg_rent_per_sqm"],
         population_density=data["population_density"],
-        city_avg_sell_per_sqm=data["avg_sell_per_sqm"],
+        city_avg_sell_per_sqm=dvf_price or data["avg_sell_per_sqm"],  # DVF wins if loaded
         transport_score=data["transport_score"],
         commercial_density=data["commercial_density"],
     )

@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
+from app.enrichment.dvf_enricher import refresh_all_cities
 from app.enrichment.pipeline import run_enrichment_pipeline
 from app.ml.price_estimator import predict_price
 from app.ml.training import trigger_training
@@ -172,6 +173,13 @@ async def retrain_price_model(db: AsyncSession | None = None):
     finally:
         if own_session:
             await db.close()
+
+
+async def refresh_dvf_prices():
+    """Download latest DVF garage transaction medians for all tracked cities."""
+    logger.info("Starting DVF price refresh...")
+    await refresh_all_cities()
+    logger.info("DVF price refresh complete")
 
 
 async def scrape_leboncoin():

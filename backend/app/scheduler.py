@@ -17,8 +17,25 @@ def setup_scheduler():
     from app.jobs import (
         enrich_pending_listings,
         ingest_mock_data,
+        refresh_dvf_prices,
         retrain_price_model,
         scrape_leboncoin,
+    )
+
+    # DVF initial load at startup
+    scheduler.add_job(
+        refresh_dvf_prices,
+        trigger="date",
+        id="dvf_initial_load",
+        replace_existing=True,
+    )
+
+    # DVF weekly refresh every Sunday at 02:00
+    scheduler.add_job(
+        refresh_dvf_prices,
+        trigger=CronTrigger(day_of_week="sun", hour=2, minute=0),
+        id="dvf_weekly_refresh",
+        replace_existing=True,
     )
 
     # Seed mock data once at startup (job checks internally if already seeded)
